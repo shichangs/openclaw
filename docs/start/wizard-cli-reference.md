@@ -16,12 +16,13 @@ For the short guide, see [Onboarding Wizard (CLI)](/start/wizard).
 
 Local mode (default) walks you through:
 
-- Model and auth setup (OpenAI Code subscription OAuth, Anthropic API key or setup token, plus MiniMax, GLM, Ollama, Moonshot, and AI Gateway options)
+- Model and auth setup (OpenAI Code subscription OAuth, Anthropic API key or setup token, plus MiniMax, GLM, Moonshot, and AI Gateway options)
 - Workspace location and bootstrap files
 - Gateway settings (port, bind, auth, tailscale)
 - Channels and providers (Telegram, WhatsApp, Discord, Google Chat, Mattermost plugin, Signal)
 - Daemon install (LaunchAgent or systemd user unit)
 - Health check
+- Optional rescue watchdog setup
 - Skills setup
 
 Remote mode configures this machine to connect to a gateway elsewhere.
@@ -84,6 +85,13 @@ It does not install or modify anything on the remote host.
   <Step title="Health check">
     - Starts gateway (if needed) and runs `openclaw health`.
     - `openclaw status --deep` adds gateway health probes to status output.
+  </Step>
+  <Step title="Rescue watchdog">
+    - Optional one-click setup during local onboarding, or via non-interactive `--rescue-watchdog`.
+    - Creates a second isolated rescue profile with its own workspace, Gateway port, auth token, and managed service.
+    - Adds a rescue cron job that probes the primary profile every 5 minutes and runs restart/repair commands when the primary gateway is unhealthy.
+    - Rescue setup is not available while onboarding profiles already named `rescue` or ending in `-rescue`.
+    - On Linux, rescue setup is skipped when systemd user services are unavailable.
   </Step>
   <Step title="Skills">
     - Reads available skills and checks requirements.
@@ -178,11 +186,6 @@ What you set:
     Prompts for `SYNTHETIC_API_KEY`.
     More detail: [Synthetic](/providers/synthetic).
   </Accordion>
-  <Accordion title="Ollama (Cloud and local open models)">
-    Prompts for base URL (default `http://127.0.0.1:11434`), then offers Cloud + Local or Local mode.
-    Discovers available models and suggests defaults.
-    More detail: [Ollama](/providers/ollama).
-  </Accordion>
   <Accordion title="Moonshot and Kimi Coding">
     Moonshot (Kimi K2) and Kimi Coding configs are auto-written.
     More detail: [Moonshot AI (Kimi + Kimi Coding)](/providers/moonshot).
@@ -263,6 +266,8 @@ Typical fields in `~/.openclaw/openclaw.json`:
 - `wizard.lastRunCommit`
 - `wizard.lastRunCommand`
 - `wizard.lastRunMode`
+
+Non-interactive JSON output can also include `rescueWatchdog` with the generated rescue profile name, port, workspace, and cron job details when `--rescue-watchdog` is enabled.
 
 `openclaw agents add` writes `agents.list[]` and optional `bindings`.
 

@@ -23,6 +23,7 @@ Interactive onboarding wizard (local or remote Gateway setup).
 openclaw onboard
 openclaw onboard --flow quickstart
 openclaw onboard --flow manual
+openclaw onboard --rescue-watchdog
 openclaw onboard --mode remote --remote-url wss://gateway-host:18789
 ```
 
@@ -42,18 +43,6 @@ openclaw onboard --non-interactive \
 ```
 
 `--custom-api-key` is optional in non-interactive mode. If omitted, onboarding checks `CUSTOM_API_KEY`.
-
-Non-interactive Ollama:
-
-```bash
-openclaw onboard --non-interactive \
-  --auth-choice ollama \
-  --custom-base-url "http://ollama-host:11434" \
-  --custom-model-id "qwen3.5:27b" \
-  --accept-risk
-```
-
-`--custom-base-url` defaults to `http://127.0.0.1:11434`. `--custom-model-id` is optional; if omitted, onboarding uses Ollama's suggested defaults. Cloud model IDs such as `kimi-k2.5:cloud` also work here.
 
 Store provider keys as refs instead of plaintext:
 
@@ -83,6 +72,14 @@ Gateway token options in non-interactive mode:
 - With `--install-daemon`, if token mode requires a token and the configured token SecretRef is unresolved, onboarding fails closed with remediation guidance.
 - With `--install-daemon`, if both `gateway.auth.token` and `gateway.auth.password` are configured and `gateway.auth.mode` is unset, onboarding blocks install until mode is set explicitly.
 
+Rescue watchdog option:
+
+- `--rescue-watchdog` creates a second isolated local profile that monitors the primary profile and restarts it automatically when health checks fail.
+- Rescue setup installs its own local Gateway service, uses a separate workspace and port, and adds a rescue cron job that probes the primary profile every 5 minutes.
+- If needed, onboarding automatically enables primary `--install-daemon` because rescue depends on the main Gateway running as a managed service.
+- Interactive QuickStart keeps its minimal prompt set, so rescue watchdog appears there only when you pass `--rescue-watchdog` explicitly.
+- Rescue onboarding is only supported for normal profiles. It is skipped for profiles already named `rescue` or ending in `-rescue`.
+
 Example:
 
 ```bash
@@ -92,15 +89,9 @@ openclaw onboard --non-interactive \
   --auth-choice skip \
   --gateway-auth token \
   --gateway-token-ref-env OPENCLAW_GATEWAY_TOKEN \
+  --rescue-watchdog \
   --accept-risk
 ```
-
-Non-interactive local gateway health:
-
-- Unless you pass `--skip-health`, onboarding waits for a reachable local gateway before it exits successfully.
-- `--install-daemon` starts the managed gateway install path first. Without it, you must already have a local gateway running, for example `openclaw gateway run`.
-- If you only want config/workspace/bootstrap writes in automation, use `--skip-health`.
-- On native Windows, `--install-daemon` tries Scheduled Tasks first and falls back to a per-user Startup-folder login item if task creation is denied.
 
 Interactive onboarding behavior with reference mode:
 
