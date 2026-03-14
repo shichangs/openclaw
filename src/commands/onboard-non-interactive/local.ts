@@ -1,7 +1,9 @@
 import { formatCliCommand } from "../../cli/command-format.js";
+import { isValidProfileName } from "../../cli/profile-utils.js";
 import type { OpenClawConfig } from "../../config/config.js";
 import { resolveGatewayPort, writeConfigFile } from "../../config/config.js";
 import { logConfigUpdated } from "../../config/logging.js";
+import { isSystemdUserServiceAvailable } from "../../daemon/systemd.js";
 import type { RuntimeEnv } from "../../runtime.js";
 import { DEFAULT_GATEWAY_DAEMON_RUNTIME } from "../daemon-runtime.js";
 import { applyOnboardingLocalWorkspaceConfig } from "../onboard-config.js";
@@ -12,6 +14,11 @@ import {
   resolveControlUiLinks,
   waitForGatewayReachable,
 } from "../onboard-helpers.js";
+import {
+  canEnableRescueWatchdog,
+  resolveMonitoredProfileName,
+  setupRescueWatchdog,
+} from "../onboard-rescue.js";
 import type { OnboardOptions } from "../onboard-types.js";
 import { inferAuthChoiceFromFlags } from "./local/auth-choice-inference.js";
 import { applyNonInteractiveGatewayConfig } from "./local/gateway-config.js";
@@ -65,6 +72,39 @@ async function collectGatewayHealthFailureDiagnostics(): Promise<
   return diagnostics.service || diagnostics.lastGatewayError || diagnostics.inspectError
     ? diagnostics
     : undefined;
+}
+
+export function resolveNonInteractiveRescueWatchdogPlan(params: {
+  opts: Pick<OnboardOptions, "installDaemon" | "rescueWatchdog">;
+  monitoredProfile: string;
+  platform: NodeJS.Platform;
+  systemdAvailable: boolean;
+}) {
+  const rescueRequested = params.opts.rescueWatchdog === true;
+  const rescueSupported =
+    rescueRequested &&
+    canEnableRescueWatchdog(resolveMonitoredProfileName(params.monitoredProfile));
+  const rescueAvailable =
+    rescueSupported && (params.platform !== "linux" || params.systemdAvailable);
+  const messages: string[] = [];
+
+  if (rescueRequested && !rescueSupported) {
+    messages.push(
+      `Rescue watchdog is not supported while onboarding the "${resolveMonitoredProfileName(params.monitoredProfile)}" profile; skipping rescue watchdog setup.`,
+    );
+  } else if (rescueRequested && !rescueAvailable) {
+    messages.push(
+      "Rescue watchdog requires systemd user services on Linux, but they are unavailable here; skipping rescue watchdog setup.",
+    );
+  } else if (rescueAvailable && params.opts.installDaemon !== true) {
+    messages.push("Rescue watchdog requested; enabling managed Gateway service install.");
+  }
+
+  return {
+    installDaemon: Boolean(params.opts.installDaemon || rescueAvailable),
+    rescueWatchdogEnabled: rescueAvailable,
+    messages,
+  };
 }
 
 export async function runNonInteractiveOnboardingLocal(params: {
@@ -123,6 +163,25 @@ export async function runNonInteractiveOnboardingLocal(params: {
   }
   nextConfig = gatewayResult.nextConfig;
 
+  const systemdAvailable =
+    process.platform === "linux" ? await isSystemdUserServiceAvailable() : true;
+  const monitoredProfile = resolveMonitoredProfileName(process.env.OPENCLAW_PROFILE ?? "default");
+  if (monitoredProfile !== "default" && !isValidProfileName(monitoredProfile)) {
+    runtime.error(`Invalid OPENCLAW_PROFILE: ${JSON.stringify(monitoredProfile)}`);
+    runtime.exit(2);
+    return;
+  }
+  const rescuePlan = resolveNonInteractiveRescueWatchdogPlan({
+    opts,
+    monitoredProfile,
+    platform: process.platform,
+    systemdAvailable,
+  });
+  for (const message of rescuePlan.messages) {
+    runtime.log(message);
+  }
+  const installDaemon = rescuePlan.installDaemon;
+
   nextConfig = applyNonInteractiveSkillsConfig({ nextConfig, opts, runtime });
 
   nextConfig = applyWizardMetadata(nextConfig, { command: "onboard", mode });
@@ -141,14 +200,18 @@ export async function runNonInteractiveOnboardingLocal(params: {
         skippedReason?: "systemd-user-unavailable";
       }
     | undefined;
-  if (opts.installDaemon) {
+  if (installDaemon) {
     const { installGatewayDaemonNonInteractive } = await import("./local/daemon-install.js");
-    const daemonInstall = await installGatewayDaemonNonInteractive({
+    const daemonInstallResult = await installGatewayDaemonNonInteractive({
       nextConfig,
-      opts,
+      opts: { ...opts, installDaemon },
       runtime,
       port: gatewayResult.port,
     });
+    const daemonInstall =
+      typeof daemonInstallResult === "boolean"
+        ? { installed: daemonInstallResult }
+        : daemonInstallResult;
     daemonInstallStatus = daemonInstall.installed
       ? {
           requested: true,
@@ -159,31 +222,61 @@ export async function runNonInteractiveOnboardingLocal(params: {
           installed: false,
           skippedReason: daemonInstall.skippedReason,
         };
-    if (!daemonInstall.installed && !opts.skipHealth) {
-      logNonInteractiveOnboardingFailure({
-        opts,
-        runtime,
-        mode,
-        phase: "daemon-install",
-        message:
-          daemonInstall.skippedReason === "systemd-user-unavailable"
-            ? "Gateway service install is unavailable because systemd user services are not reachable in this Linux session."
-            : "Gateway service install did not complete successfully.",
-        installDaemon: true,
-        daemonInstall: {
-          requested: true,
-          installed: false,
-          skippedReason: daemonInstall.skippedReason,
+    if (!daemonInstall.installed) {
+      if (!opts.skipHealth) {
+        logNonInteractiveOnboardingFailure({
+          opts,
+          runtime,
+          mode,
+          phase: "daemon-install",
+          message:
+            daemonInstall.skippedReason === "systemd-user-unavailable"
+              ? "Gateway service install is unavailable because systemd user services are not reachable in this Linux session."
+              : rescuePlan.rescueWatchdogEnabled
+                ? "Rescue watchdog requires a healthy primary managed service, but Gateway service install did not complete successfully."
+                : "Gateway service install did not complete successfully.",
+          installDaemon: true,
+          daemonInstall: {
+            requested: true,
+            installed: false,
+            skippedReason: daemonInstall.skippedReason,
+          },
+          daemonRuntime: daemonRuntimeRaw,
+          hints:
+            daemonInstall.skippedReason === "systemd-user-unavailable"
+              ? [
+                  "Fix: rerun without `--install-daemon` for one-shot setup, or enable a working user-systemd session and retry.",
+                  "If your auth profile uses env-backed refs, keep those env vars set in the shell that runs `openclaw gateway run` or `openclaw agent --local`.",
+                ]
+              : [`Run \`${formatCliCommand("openclaw gateway status --deep")}\` for more detail.`],
+        });
+      } else if (rescuePlan.rescueWatchdogEnabled) {
+        runtime.error(
+          "Rescue watchdog requires a healthy primary managed service. Gateway service install failed during onboarding, so rescue watchdog was not configured.",
+        );
+      }
+      runtime.exit(1);
+      return;
+    }
+  }
+
+  let rescueWatchdog;
+  if (rescuePlan.rescueWatchdogEnabled) {
+    try {
+      rescueWatchdog = await setupRescueWatchdog({
+        sourceConfig: nextConfig,
+        workspaceDir,
+        mainPort: gatewayResult.port,
+        monitoredProfile,
+        runtime: daemonRuntimeRaw,
+        output: {
+          log: runtime.log,
         },
-        daemonRuntime: daemonRuntimeRaw,
-        hints:
-          daemonInstall.skippedReason === "systemd-user-unavailable"
-            ? [
-                "Fix: rerun without `--install-daemon` for one-shot setup, or enable a working user-systemd session and retry.",
-                "If your auth profile uses env-backed refs, keep those env vars set in the shell that runs `openclaw gateway run` or `openclaw agent --local`.",
-              ]
-            : [`Run \`${formatCliCommand("openclaw gateway status --deep")}\` for more detail.`],
       });
+    } catch (error) {
+      runtime.error(
+        error instanceof Error ? `Rescue watchdog setup failed: ${error.message}` : String(error),
+      );
       runtime.exit(1);
       return;
     }
@@ -200,12 +293,12 @@ export async function runNonInteractiveOnboardingLocal(params: {
     const probe = await waitForGatewayReachable({
       url: links.wsUrl,
       token: gatewayResult.gatewayToken,
-      deadlineMs: opts.installDaemon
+      deadlineMs: installDaemon
         ? INSTALL_DAEMON_HEALTH_DEADLINE_MS
         : ATTACH_EXISTING_GATEWAY_HEALTH_DEADLINE_MS,
     });
     if (!probe.ok) {
-      const diagnostics = opts.installDaemon
+      const diagnostics = installDaemon
         ? await collectGatewayHealthFailureDiagnostics()
         : undefined;
       logNonInteractiveOnboardingFailure({
@@ -219,11 +312,11 @@ export async function runNonInteractiveOnboardingLocal(params: {
           wsUrl: links.wsUrl,
           httpUrl: links.httpUrl,
         },
-        installDaemon: Boolean(opts.installDaemon),
+        installDaemon: Boolean(installDaemon),
         daemonInstall: daemonInstallStatus,
-        daemonRuntime: opts.installDaemon ? daemonRuntimeRaw : undefined,
+        daemonRuntime: installDaemon ? daemonRuntimeRaw : undefined,
         diagnostics,
-        hints: !opts.installDaemon
+        hints: !installDaemon
           ? [
               "Non-interactive local onboarding only waits for an already-running gateway unless you pass --install-daemon.",
               `Fix: start \`${formatCliCommand("openclaw gateway run")}\`, re-run with \`--install-daemon\`, or use \`--skip-health\`.`,
@@ -251,9 +344,10 @@ export async function runNonInteractiveOnboardingLocal(params: {
       authMode: gatewayResult.authMode,
       tailscaleMode: gatewayResult.tailscaleMode,
     },
-    installDaemon: Boolean(opts.installDaemon),
+    installDaemon: Boolean(installDaemon),
     daemonInstall: daemonInstallStatus,
-    daemonRuntime: opts.installDaemon ? daemonRuntimeRaw : undefined,
+    daemonRuntime: installDaemon ? daemonRuntimeRaw : undefined,
+    rescueWatchdog,
     skipSkills: Boolean(opts.skipSkills),
     skipHealth: Boolean(opts.skipHealth),
   });
